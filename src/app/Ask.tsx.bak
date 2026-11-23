@@ -1,0 +1,352 @@
+import { ArrowRight, Send, Sparkles } from 'lucide-react'
+import { useState } from 'react'
+import { Link } from 'react-router-dom'
+import type { FormEvent } from 'react'
+import { money } from '../../../backend/shared/domain'
+import type { Deal, DealDraft, Session } from '../../../backend/shared/types'
+import { api, errorText } from './api'
+import type { Answer, TeamMember } from './api'
+import { DealTable, stageLabels } from './Deals'
+import { RiskList } from './Pipeline'
+
+const suggestions = [
+  'How many deals did I close this month?',
+  'How many deals did I win last month?',
+  'What is my won revenue this month?',
+  'What is in my open pipeline?',
+  'Compare my sales this month with last month.',
+  'How much revenue do I still need to hit my target?',
+  'What if my top 2 open deals close this month?',
+  'Which of my deals have been inactive for 14 days?',
+]
+const scopedSuggestions = [
+  'How many deals closed this month?',
+  'How many deals were won last month?',
+  'What was the won revenue this month?',
+  'Show the open pipeline.',
+  'Compare sales this month with last month.',
+  'How much revenue is needed to hit the target?',
+  'What if the top 2 open deals close this month?',
+  'Which deals have been inactive for 14 days?',
+]
+export function Ask({
+  session,
+  members,
+  onOpen,
+  refresh,
+}: {
+  session: Session
+  members: TeamMember[]
+  onOpen: (deal: Deal) => void
+  refresh: () => Promise<void>
+}) {
+  const [question, setQuestion] = useState('')
+  const [scope, setScope] = useState('mine')
+  const [explicitScope, setExplicitScope] = useState(false)
+  const [draft, setDraft] = useState<DealDraft>()
+  const [conversation, setConversation] = useState<{ question: string; reply: string }[]>([])
+  const [saved, setSaved] = useState<{ deal: Deal; changed: string[]; taskId?: string }>()
+  const [answer, setAnswer] = useState<Answer>()
+  const [error, setError] = useState('')
+  const [busy, setBusy] = useState(false)
+  const team = session.permissions.includes('ask:team')
+
+  async function ask(text: string, selected?: string) {
+    if ((!selected && text.trim().length < 2) || busy) return
+    setError('')
+    setBusy(true)
+    try {
+      const next = await api<Answer>('/ask', 'POST', {
+        question: selected ? 'Select deal' : text,
+        scope: scope === 'team' || (scope !== 'mine' && scope !== 'auto') ? 'team' : 'mine',
+        memberId: scope !== 'mine' && scope !== 'team' && scope !== 'auto' ? scope : undefined,
+        explicitScope,
+        draftId: draft?.id,
+        revision: draft?.revision,
+        selected,
+      })
+      setAnswer(next)
+      setDraft(next.draft)
+      setSaved(undefined)
+      setQuestion('')
+      if (next.draft)
+        setConversation((items) => [...(draft ? items : []), { question: text, reply: next.text }])
+    } catch (cause) {
+      setError(errorText(cause))
+    } finally {
+      setBusy(false)
+    }
+  }
+  async function confirm() {
+    if (!draft?.ready || busy) return
+    setBusy(true)
+    setError('')
+    try {
+      const receipt = await api<NonNullable<typeof saved>>(
+        '/ask/drafts/' + draft.id + '/confirm',
+        'POST',
+        {
+          revision: draft.revision,
+        },
+      )
+      setSaved(receipt)
+      setDraft(undefined)
+      setAnswer(undefined)
+      setQuestion('')
+      await refresh()
+    } catch (cause) {
+      setError(errorText(cause))
+    } finally {
+      setBusy(false)
+    }
+  }
+  function resetDraft() {
+    setDraft(undefined)
+    setSaved(undefined)
+    setAnswer(undefined)
+    setConversation([])
+    setQuestion('')
+    setError('')
+  }
+  function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    void ask(question)
+  }
+  return (
+    <>
+      <div className="page-heading">
+        <div>
+          <h1>Ask CloseSignal</h1>
+          <p>Get answers from the deals recorded in your workspace.</p>
+        </div>
+      </div>
+      <section className="card ask-card">
+        <div className="section-title">
+          <span className="metric-icon">
+            <Sparkles size={20} />
+          </span>
+          <div>
+            <h2>Ask about sales</h2>
+            <p>
+              {session.modelEnabled
+                ? 'Local model with workspace data'
+                : 'Guided questions with workspace data'}
+            </p>
+          </div>
+        </div>
+        {team && (
+          <label className="scope">
+            Answer scope
+            <select
+              value={scope}
+              onChange={(event) => {
+                setScope(event.target.value)
+                setExplicitScope(event.target.value !== 'auto')
+                setAnswer(undefined)
+              }}
+              disabled={busy || Boolean(draft)}
+            >
+              <option value="mine">My sales</option>
+              <option value="auto">Use the question</option>
+              <option value="team">Entire workspace</option>
+              {members
+                .filter((member) => member.id !== session.id)
+                .map((member) => (
+                  <option key={member.id} value={member.id}>
+                    {member.name} ({member.email})
+                  </option>
+                ))}
+            </select>
+          </label>
+        )}
+        {!draft && (
+          <div className="suggestions">
+            {(scope === 'mine' || scope === 'auto' ? suggestions : scopedSuggestions).map(
+              (prompt) => (
+                <button
+                  className="suggestion"
+                  key={prompt}
+                  onClick={() => void ask(prompt)}
+                  disabled={busy}
+                >
+                  {prompt}
+                  <ArrowRight size={15} />
+                </button>
+              ),
+            )}
+          </div>
+        )}
+        {draft && (
+          <ol className="ask-conversation">
+            {conversation.map((turn, index) => (
+              <li key={index}>
+                <strong>{turn.question}</strong>
+                <p>{turn.reply}</p>
+              </li>
+            ))}
+          </ol>
+        )}
+        <form className="ask-form" onSubmit={submit}>
+          <input
+            aria-label="Sales question"
+            value={question}
+            onChange={(event) => setQuestion(event.target.value)}
+            placeholder={
+              draft
+                ? 'Reply to continue or enter a field, e.g. Company: Amberline'
+                : 'Ask about deals, revenue, or monthly targets…'
+            }
+            maxLength={500}
+          />
+          <button className="primary" disabled={busy || question.trim().length < 2}>
+            <Send size={17} /> {draft ? 'Reply' : 'Ask'}
+          </button>
+        </form>
+        {busy && <p role="status">Checking sales records…</p>}
+        {error && (
+          <p className="notice error" role="alert">
+            {error}
+          </p>
+        )}
+      </section>
+      {draft && (
+        <section className="card advanced-card" aria-live="polite">
+          <div>
+            <h2>{draft.kind === 'create' ? 'New deal draft' : 'Deal update draft'}</h2>
+          </div>
+          <dl className="draft-fields">
+            <div>
+              <dt>Deal name</dt>
+              <dd>{draft.fields.title || 'Needed'}</dd>
+            </div>
+            <div>
+              <dt>Company</dt>
+              <dd>{draft.fields.company || '—'}</dd>
+            </div>
+            <div>
+              <dt>Value</dt>
+              <dd>
+                {draft.fields.amount === undefined
+                  ? 'Needed'
+                  : money(draft.fields.amount, session.currency)}
+              </dd>
+            </div>
+            <div>
+              <dt>Status</dt>
+              <dd>{stageLabels[draft.fields.stage ?? 'open']}</dd>
+            </div>
+            <div>
+              <dt>Assignee</dt>
+              <dd>{draft.assignee ?? 'Choose an assignee'}</dd>
+            </div>
+            {draft.dueDate && (
+              <div>
+                <dt>Follow-up due (UTC)</dt>
+                <dd>{draft.dueDate}</dd>
+              </div>
+            )}
+            {(draft.fields.closedAt || draft.deal?.closedAt) && (
+              <div>
+                <dt>Actual close date (UTC)</dt>
+                <dd>{draft.fields.closedAt ?? 'Cleared'}</dd>
+              </div>
+            )}
+            {(draft.fields.expectedCloseAt || draft.deal?.expectedCloseAt) && (
+              <div>
+                <dt>Expected close date</dt>
+                <dd>{draft.fields.expectedCloseAt ?? 'Cleared'}</dd>
+              </div>
+            )}
+            {draft.fields.pipelineStage && (
+              <div>
+                <dt>Pipeline stage</dt>
+                <dd>{draft.fields.pipelineStage}</dd>
+              </div>
+            )}
+          </dl>
+          {draft.choices?.map((deal) => (
+            <button
+              className="secondary"
+              key={deal.id}
+              disabled={busy}
+              onClick={() => void ask(deal.title, deal.id)}
+            >
+              {deal.title} · {deal.ownerName} · {money(deal.amount, session.currency)}
+            </button>
+          ))}
+          <div className="button-row">
+            <button className="secondary" disabled={busy} onClick={resetDraft}>
+              Discard draft
+            </button>
+            <button
+              className="primary"
+              disabled={busy || !draft.ready}
+              onClick={() => void confirm()}
+            >
+              {draft.kind === 'create' ? 'Create deal' : 'Save deal update'}
+            </button>
+          </div>
+        </section>
+      )}
+      {saved && (
+        <section className="card advanced-card" aria-live="polite">
+          <h2>Deal saved</h2>
+          <Link className="deal-link" to={'/deals/' + saved.deal.id}>
+            {saved.deal.title}
+          </Link>
+          {!!saved.changed.length && (
+            <p>
+              Saved fields:{' '}
+              {saved.changed
+                .map(
+                  (field) =>
+                    ({
+                      title: 'deal name',
+                      company: 'company',
+                      ownerId: 'assignee',
+                      amount: 'value',
+                      stage: 'status',
+                      closedAt: 'actual close date',
+                      expectedCloseAt: 'expected close date',
+                      pipelineStage: 'pipeline stage',
+                    })[field] ?? field,
+                )
+                .join(', ')}
+              .
+            </p>
+          )}
+          {saved.taskId && <p>Follow-up scheduled.</p>}
+        </section>
+      )}
+      {answer && !draft && (
+        <section className="card ask-result" aria-live="polite">
+          <div className="section-heading">
+            <div>
+              <p>{answer.method === 'local' ? 'Local model' : 'Guided query'}</p>
+              <h2>Answer</h2>
+            </div>
+            {answer.result && (
+              <span className="date-chip">
+                {answer.currentPipeline
+                  ? 'Current pipeline'
+                  : answer.result.from === '0001-01-01'
+                    ? 'All recorded dates'
+                    : `${answer.result.from} to ${answer.result.to}`}
+              </span>
+            )}
+          </div>
+          <p className="answer-copy">{answer.text}</p>
+          {!!answer.alerts?.length && <RiskList alerts={answer.alerts} onOpen={onOpen} />}
+          {!!answer.result?.deals.length && (
+            <DealTable
+              deals={answer.result.deals}
+              currency={session.currency}
+              showOwner={team}
+              onOpen={onOpen}
+            />
+          )}
+        </section>
+      )}
+    </>
+  )
+}
